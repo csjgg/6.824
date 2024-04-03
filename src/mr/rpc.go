@@ -6,24 +6,32 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+type TaskType int
 
-type ExampleArgs struct {
-	X int
+const (
+	Map TaskType = iota
+	Reduce
+	End
+)
+
+// rpc args and reply types.
+type Args struct {
+	Tasknum int
+	Succeed bool
 }
 
-type ExampleReply struct {
-	Y int
+type Reply struct {
+	Task      TaskType
+	Filename  string
+	Reducenum int // for a mapper, this will be the Nreduce; for a Reducer, this will be the num of reduce
+	Mappernum int // same as Reduce
+	Tasknum   int
 }
-
-// Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
