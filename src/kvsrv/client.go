@@ -1,13 +1,15 @@
 package kvsrv
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
 
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
-	server *labrpc.ClientEnd
-	// You will have to modify this struct.
+	server  *labrpc.ClientEnd
+	lastseq int64
 }
 
 func nrand() int64 {
@@ -20,7 +22,7 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
-	// You'll have to add code here.
+	ck.lastseq = nrand()
 	return ck
 }
 
@@ -35,9 +37,15 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+	var args GetArgs
+	args.Key = key
+	reply := GetReply{}
+	for {
+		ok := ck.server.Call("KVServer.Get", &args, &reply)
+		if ok {
+			return reply.Value
+		}
+	}
 }
 
 // shared by Put and Append.
@@ -49,8 +57,20 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
-	// You will have to modify this function.
-	return ""
+	args := PutAppendArgs{
+		Key:   key,
+		Value: value,
+	}
+	reply := PutAppendReply{}
+	args.Lastseq = ck.lastseq
+	args.Seq = nrand()
+	for {
+		ok := ck.server.Call("KVServer."+op, &args, &reply)
+		if ok {
+			ck.lastseq = args.Seq
+			return reply.Value
+		}
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
