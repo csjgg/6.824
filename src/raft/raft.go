@@ -81,6 +81,7 @@ type Raft struct {
 	// Persistent state on all servers
 	currentTerm   int
 	votedFor      int // -1 if none
+	voted         int
 	logs          []Log
 	heartbeattime time.Time
 	// Volatile state on all servers
@@ -297,7 +298,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 // send vote request, if be voted, add voted
-func (rf *Raft) sendRV(i int, voted *int, vomu *sync.Mutex) {
+func (rf *Raft) sendRV(i int) {
 	rf.mu.Lock()
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
@@ -306,50 +307,44 @@ func (rf *Raft) sendRV(i int, voted *int, vomu *sync.Mutex) {
 	reply := RequestVoteReply{}
 	rf.mu.Unlock()
 	rf.sendRequestVote(i, &args, &reply)
+	rf.mu.Lock()
 	if reply.VoteGranted {
-		vomu.Lock()
-		*voted++
-		DPrintf("Raft %v get vote from %v, voted %d", rf.me, i, *voted)
-		vomu.Unlock()
+		rf.voted++
+		DPrintf("Raft %v get vote from %v, voted %d", rf.me, i, rf.voted)
 	} else {
 		DPrintf("Raft %v get reject from %v", rf.me, i)
 	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) startelection() {
-	voted := 1
-	var vomu sync.Mutex
+	rf.voted = 1
 	rf.currentTerm++
 	currentterm := rf.currentTerm
 	rf.votedFor = rf.me
 	rf.heartbeattime = time.Now()
 	rf.state = Candidate
-	rf.mu.Unlock()
 
 	// send RequestVote to all other servers
 	for i := range rf.peers {
 		if rf.state != Candidate {
 			// heartbeat received
-			rf.mu.Lock()
 			return
 		}
-		vomu.Lock()
-		if voted > len(rf.peers)/2 {
-			vomu.Unlock()
+		if rf.voted > len(rf.peers)/2 {
 			break
 		}
-		vomu.Unlock()
 		if i == rf.me {
 			continue
 		}
-		go rf.sendRV(i, &voted, &vomu)
+		go rf.sendRV(i)
 	}
+	rf.mu.Unlock()
 	time.Sleep(100 * time.Millisecond)
 
 	// check the result
 	rf.mu.Lock()
-	vomu.Lock()
-	if voted > len(rf.peers)/2 {
+	if rf.voted > len(rf.peers)/2 {
 		if rf.currentTerm == currentterm {
 			DPrintf("Raft %v become leader", rf.me)
 			rf.leaderid = rf.me
@@ -357,7 +352,6 @@ func (rf *Raft) startelection() {
 			go rf.sendHeartbeat()
 		}
 	}
-	vomu.Unlock()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
