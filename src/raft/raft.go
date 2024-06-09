@@ -298,7 +298,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 // send vote request, if be voted, add voted
-func (rf *Raft) sendRV(i int) {
+func (rf *Raft) sendRV(i int, condi *sync.Cond) {
 	rf.mu.Lock()
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
@@ -311,6 +311,9 @@ func (rf *Raft) sendRV(i int) {
 	if reply.VoteGranted {
 		rf.voted++
 		DPrintf("Raft %v get vote from %v, voted %d", rf.me, i, rf.voted)
+		if rf.voted > len(rf.peers)/2 {
+			condi.Broadcast()
+		}
 	} else {
 		DPrintf("Raft %v get reject from %v", rf.me, i)
 	}
@@ -324,6 +327,7 @@ func (rf *Raft) startelection() {
 	rf.votedFor = rf.me
 	rf.heartbeattime = time.Now()
 	rf.state = Candidate
+	var condi = sync.NewCond(&rf.mu)
 
 	// send RequestVote to all other servers
 	for i := range rf.peers {
@@ -337,13 +341,18 @@ func (rf *Raft) startelection() {
 		if i == rf.me {
 			continue
 		}
-		go rf.sendRV(i)
+		go rf.sendRV(i, condi)
 	}
-	rf.mu.Unlock()
-	time.Sleep(100 * time.Millisecond)
+	go func() {
+		time.Sleep(time.Duration(100+(rand.Int63()%100)) * time.Millisecond)
+		rf.mu.Lock()
+		condi.Broadcast()
+		rf.mu.Unlock()
+	}()
+
+	condi.Wait()
 
 	// check the result
-	rf.mu.Lock()
 	if rf.voted > len(rf.peers)/2 {
 		if rf.currentTerm == currentterm {
 			DPrintf("Raft %v become leader", rf.me)
