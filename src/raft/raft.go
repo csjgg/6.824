@@ -313,9 +313,6 @@ func (rf *Raft) Copytofollower(i int) {
 				rf.nextIndex[i]--
 			}
 		}
-		rf.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
-		rf.mu.Lock()
 	}
 }
 
@@ -592,7 +589,7 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		for rf.state != Leader && time.Since(rf.heartbeattime) > (time.Duration(1200+(rand.Int63()%1000))*time.Millisecond) {
+		for rf.state != Leader && time.Since(rf.heartbeattime) > (time.Duration(700+(rand.Int63()%700))*time.Millisecond) {
 			DPrintf("Raft %v start election, term %v", rf.me, rf.currentTerm)
 			rf.Startelection()
 		}
