@@ -123,20 +123,7 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	e.Encode(rf.lastApplied)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.logs)
-	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
-}
-
-func (rf *Raft) snappersist() {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.lastApplied)
-	e.Encode(rf.commitIndex)
+	e.Encode(rf.snapshotindex)
 	e.Encode(rf.logs)
 	raftstate := w.Bytes()
 	rf.persister.Save(raftstate, rf.snapshot)
@@ -154,18 +141,28 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logs []Log
-	var lastApplied int
-	var commitindex int
-	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil || d.Decode(&lastApplied) != nil || d.Decode(&commitindex) != nil || d.Decode(&logs) != nil {
-		log.Printf("Persister is not enough")
+	var snapshotindex int
+	if d.Decode(&currentTerm) != nil {
+		log.Printf("decode error no currentTerm")
 	} else {
 		rf.currentTerm = currentTerm
+	}
+	if d.Decode(&votedFor) != nil {
+		log.Printf("decode error no votedFor")
+	} else {
 		rf.votedFor = votedFor
-		rf.lastApplied = lastApplied
-		rf.commitIndex = commitindex
+	}
+	if err := d.Decode(&snapshotindex); err != nil {
+		log.Printf("decode error no snapshotindex: %v", err)
+	} else {
+		rf.snapshotindex = snapshotindex
+	}
+	if d.Decode(&logs) != nil {
+		log.Printf("decode error no logs")
+	} else {
 		rf.logs = logs
 	}
+	rf.lastApplied = rf.snapshotindex
 }
 
 // --------------------------------------
@@ -257,7 +254,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.logs = rf.logs[index-rf.snapshotindex:]
 	rf.snapshotindex = index
 	rf.snapshot = snapshot
-	rf.snappersist()
+	rf.persist()
 	// DPrintf("Raft %v logs %v", rf.me, rf.logs)
 }
 
@@ -309,8 +306,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapshot = args.Snapshot
 		rf.heartbeattime = time.Now()
 		go rf.Sendsnapshot(args.Snapshot, args.LastIncludedTerm, args.LastIncludedIndex)
-		rf.snappersist()
+		rf.persist()
 		reply.Success = true
+		DPrintf("Raft %v install snapshot to index %v", rf.me, args.LastIncludedIndex)
 	}
 	reply.Term = rf.currentTerm
 }
@@ -378,6 +376,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			reply.Term = rf.currentTerm
 			reply.Xlen = lenlogs + rf.snapshotindex
+			DPrintf("Raft %v follower's log is too short", rf.me)
 			return
 		}
 		// return Xterm
@@ -390,6 +389,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				previndex--
 			}
 			reply.Xindex = previndex + 1
+			DPrintf("Raft %v return Xterm", rf.me)
 			return
 		}
 		rf.heartbeattime = time.Now()
@@ -474,10 +474,10 @@ func (rf *Raft) Copytofollower(i int) {
 					Snapshot:          rf.snapshot,
 				}
 				snreply := InstallSnapshotReply{}
+				snapshotindex := rf.snapshotindex
 				rf.mu.Unlock()
 				snok := rf.sendInstallSnapshot(i, &snargs, &snreply)
 				rf.mu.Lock()
-				DPrintf("Raft %v send snapshot to %v, term %v", rf.me, i, rf.currentTerm)
 				if snreply.Term > rf.currentTerm {
 					rf.currentTerm = snreply.Term
 					rf.setfollower()
@@ -488,10 +488,12 @@ func (rf *Raft) Copytofollower(i int) {
 				}
 				if snok {
 					if snreply.Success {
-						rf.nextIndex[i] = rf.snapshotindex + 1
-						rf.matchIndex[i] = rf.snapshotindex
-					} else {
-						panic("wrong")
+						DPrintf("Raft %v send snapshot to %v, term %v", rf.me, i, rf.currentTerm)
+						rf.nextIndex[i] = snapshotindex + 1
+						rf.matchIndex[i] = snapshotindex
+						if rf.nextIndex[i] <= snapshotindex {
+							continue
+						}
 					}
 				} else {
 					continue
@@ -512,6 +514,7 @@ func (rf *Raft) Copytofollower(i int) {
 			nextindex := rf.nextIndex[i]
 			len := len(args.Entries)
 			reply := AppendEntriesReply{}
+			DPrintf("Raft %v send AppendEntries to %v, term %v, nextindex %v, len %v", rf.me, i, rf.currentTerm, nextindex, len)
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(i, &args, &reply)
 			rf.mu.Lock()
@@ -521,7 +524,7 @@ func (rf *Raft) Copytofollower(i int) {
 				if rf.nextIndex[i] < nextindex+len {
 					rf.nextIndex[i] = nextindex + len
 					rf.matchIndex[i] = nextindex + len - 1
-					DPrintf("Raft %v matchindex[%v] %v", rf.me, i, rf.matchIndex[i])
+					DPrintf("Raft %v nextindex[%v] %v matchindex[%v] %v", rf.me, i, rf.nextIndex[i], i, rf.matchIndex[i])
 				}
 			} else {
 				if reply.Term > rf.currentTerm {
@@ -544,13 +547,9 @@ func (rf *Raft) Copytofollower(i int) {
 					} else {
 						nextindex = reply.Xlen
 					}
-					if nextindex < rf.nextIndex[i] && nextindex > rf.matchIndex[i] {
+					if nextindex < rf.nextIndex[i] {
 						rf.nextIndex[i] = nextindex
 					}
-				} else {
-					rf.mu.Unlock()
-					time.Sleep(10 * time.Millisecond)
-					rf.mu.Lock()
 				}
 			}
 		}
