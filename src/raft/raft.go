@@ -126,6 +126,11 @@ func (rf *Raft) persist() {
 	e.Encode(rf.snapshotindex)
 	e.Encode(rf.logs)
 	raftstate := w.Bytes()
+	// if len(rf.snapshot) == 0 {
+	// 	DPrintf("Raft %v persist snapshot is nil", rf.me)
+	// } else {
+	// 	DPrintf("Raft %v persist snapshot is not nil", rf.me)
+	// }
 	rf.persister.Save(raftstate, rf.snapshot)
 }
 
@@ -135,7 +140,8 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 
-	rf.persister.Save(data, nil)
+	rf.snapshot = rf.persister.ReadSnapshot()
+	rf.persister.Save(data, rf.snapshot)
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -371,6 +377,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = args.Term
 			return
 		}
+		if args.PrevLogIndex-rf.snapshotindex < 0 {
+			reply.Success = true
+			reply.Term = args.Term
+			return
+		}
 		// follower's log is too short
 		if lenlogs-1+rf.snapshotindex < args.PrevLogIndex {
 			reply.Success = false
@@ -491,13 +502,13 @@ func (rf *Raft) Copytofollower(i int) {
 						DPrintf("Raft %v send snapshot to %v, term %v", rf.me, i, rf.currentTerm)
 						rf.nextIndex[i] = snapshotindex + 1
 						rf.matchIndex[i] = snapshotindex
-						if rf.nextIndex[i] <= snapshotindex {
-							continue
-						}
 					}
 				} else {
 					continue
 				}
+			}
+			if rf.nextIndex[i] <= rf.snapshotindex {
+				continue
 			}
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
