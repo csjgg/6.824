@@ -30,27 +30,6 @@ import (
 	"6.5840/labrpc"
 )
 
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in part 3D you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh, but set CommandValid to false for these
-// other uses.
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-
-	// For 3D:
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
-}
-
 // A log entry.
 type Log struct {
 	Term    int
@@ -92,10 +71,13 @@ type Raft struct {
 	matchIndex []int //index of highest log entry known to be replicated on server
 
 	// logs
-	logs          []Log
-	getlog        sync.Cond
-	apply         sync.Cond
+	logs   []Log
+	getlog sync.Cond
+	apply  sync.Cond
+
+	// snapshot
 	snapshotindex int
+	snapshot      []byte
 }
 
 // func used to check and set state
@@ -126,6 +108,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+// --------------------------------------
+// ------------- Persist ----------------
+// --------------------------------------
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -134,6 +119,8 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -142,7 +129,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.commitIndex)
 	e.Encode(rf.logs)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -171,6 +158,80 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
+// --------------------------------------
+// ------------- ApplyMsg  --------------
+// --------------------------------------
+// as each Raft peer becomes aware that successive log entries are
+// committed, the peer should send an ApplyMsg to the service (or
+// tester) on the same server, via the applyCh passed to Make(). set
+// CommandValid to true to indicate that the ApplyMsg contains a newly
+// committed log entry.
+//
+// in part 3D you'll want to send other kinds of messages (e.g.,
+// snapshots) on the applyCh, but set CommandValid to false for these
+// other uses.
+type ApplyMsg struct {
+	CommandValid bool
+	Command      interface{}
+	CommandIndex int
+
+	// For 3D:
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotTerm  int
+	SnapshotIndex int
+}
+
+// send apply message to service
+func (rf *Raft) Sendapplymessage() {
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		rf.mu.Lock()
+		rf.apply.Signal()
+		rf.mu.Unlock()
+	}()
+
+	// check and send apply message
+	rf.mu.Lock()
+	for !rf.killed() {
+		for rf.lastApplied < rf.commitIndex {
+			commitindex := rf.commitIndex
+			for i := rf.lastApplied + 1; i <= commitindex; i++ {
+				msg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logs[i-rf.snapshotindex].Command,
+					CommandIndex: i,
+				}
+				rf.mu.Unlock()
+				rf.applyCh <- msg
+				rf.mu.Lock()
+			}
+			if rf.lastApplied < commitindex {
+				rf.lastApplied = commitindex
+			}
+			go rf.persist()
+		}
+		rf.apply.Wait()
+	}
+	rf.mu.Unlock()
+}
+
+// send snapshot to service
+func (rf *Raft) Sendsnapshot(snapshot []byte, term int, index int) {
+	rf.mu.Lock()
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  term,
+		SnapshotIndex: index,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- msg
+}
+
+// --------------------------------------
+// -------------- Snapshot --------------
+// --------------------------------------
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -183,14 +244,70 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			return
 		}
 		DPrintf("Raft %v Save to snapshot to index %v", rf.me, index)
-		rf.persister.Save(nil, snapshot)
 		// last log at index0
 		rf.logs = rf.logs[index-rf.snapshotindex:]
 		rf.snapshotindex = index
+		rf.snapshot = snapshot
+		go rf.persist()
 		// DPrintf("Raft %v logs %v", rf.me, rf.logs)
 	}()
 }
 
+// --------------------------------------
+// -------- InstallSnapshot RPC ---------
+// --------------------------------------
+// InstallSnapshot RPC args structure.
+type InstallSnapshotArgs struct {
+	Term              int    // leader's term
+	LeaderId          int    // leader's id
+	LastIncludedIndex int    // the snapshot replaces all entries up through and including this index
+	LastIncludedTerm  int    // term of lastIncludedIndex
+	Snapshot          []byte // snapshot data
+}
+
+// InstallSnapshot RPC reply structure.
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
+// InstallSnapshot RPC handler.
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term >= rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.setfollower()
+		rf.leaderid = args.LeaderId
+		if args.LastIncludedIndex <= rf.snapshotindex {
+			reply.Term = rf.currentTerm
+			return
+		}
+		if args.LastIncludedIndex < len(rf.logs)-1+rf.snapshotindex {
+			rf.logs = rf.logs[args.LastIncludedIndex-rf.snapshotindex:]
+		} else {
+			rf.logs = make([]Log, 1)
+			rf.logs[0].Term = args.LastIncludedTerm
+		}
+		rf.snapshotindex = args.LastIncludedIndex
+		rf.lastApplied = args.LastIncludedIndex
+		rf.commitIndex = args.LastIncludedIndex
+		rf.snapshot = args.Snapshot
+		rf.heartbeattime = time.Now()
+		go rf.Sendsnapshot(args.Snapshot, args.LastIncludedTerm, args.LastIncludedIndex)
+		go rf.persist()
+	}
+	reply.Term = rf.currentTerm
+}
+
+// send InstallSnapshot RPC to server
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+// --------------------------------------
+// -------- AppendEntries RPC -----------
+// --------------------------------------
 // AppendEntries RPC args structure.
 type AppendEntriesArgs struct {
 	// Your data here (3A, 3B).
@@ -212,39 +329,6 @@ type AppendEntriesReply struct {
 	Xlen    int
 }
 
-// send apply message to service
-func (rf *Raft) Sendapplymessage() {
-	go func() {
-		time.Sleep(20 * time.Millisecond)
-		rf.mu.Lock()
-		rf.apply.Signal()
-		rf.mu.Unlock()
-	}()
-
-	rf.mu.Lock()
-	for !rf.killed() {
-		for rf.lastApplied < rf.commitIndex {
-			commitindex := rf.commitIndex
-			for i := rf.lastApplied + 1; i <= commitindex; i++ {
-				msg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.logs[i-rf.snapshotindex].Command,
-					CommandIndex: i,
-				}
-				rf.mu.Unlock()
-				rf.applyCh <- msg
-				rf.mu.Lock()
-			}
-			if rf.lastApplied < commitindex {
-				rf.lastApplied = commitindex
-			}
-			rf.persist()
-		}
-		rf.apply.Wait()
-	}
-	rf.mu.Unlock()
-}
-
 // AppendEntries RPC handler.
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -262,21 +346,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DPrintf("Raft %v commitindex %v", rf.me, rf.commitIndex)
 			rf.apply.Signal()
 		}
-		rf.persist()
+		go rf.persist()
 		if len(args.Entries) == 0 && args.PrevLogIndex == 0 && args.PrevLogTerm == 0 {
 			// DPrintf("Raft %v receive heartbeat from %v, term %v", rf.me, args.LeaderId, args.Term)
 			// heartbeat
 			rf.heartbeattime = time.Now()
 			reply.Success = true
 			reply.Term = args.Term
-			rf.persist()
+			go rf.persist()
 			return
 		}
 		// follower's log is too short
 		if len(rf.logs)-1+rf.snapshotindex < args.PrevLogIndex {
 			reply.Success = false
 			reply.Term = rf.currentTerm
-			rf.persist()
+			go rf.persist()
 			reply.Xlen = len(rf.logs) + rf.snapshotindex
 			return
 		}
@@ -284,7 +368,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.logs[args.PrevLogIndex-rf.snapshotindex].Term != args.PrevLogTerm {
 			reply.Success = false
 			reply.Term = rf.currentTerm
-			rf.persist()
+			go rf.persist()
 			reply.Xterm = rf.logs[args.PrevLogIndex-rf.snapshotindex].Term
 			previndex := args.PrevLogIndex
 			for previndex-rf.snapshotindex > 0 && rf.logs[previndex-rf.snapshotindex].Term != args.PrevLogTerm {
@@ -297,14 +381,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if len(args.Entries) == 0 {
 			reply.Success = true
 			reply.Term = args.Term
-			rf.persist()
+			go rf.persist()
 			return
 		}
 		DPrintf("Raft %v receive AppendEntries from %v, term %v,%v, entry len %v", rf.me, args.LeaderId, args.Term, rf.currentTerm, len(args.Entries))
 		// append entries
 		rf.logs = rf.logs[:args.PrevLogIndex+1-rf.snapshotindex]
 		rf.logs = append(rf.logs, args.Entries...)
-		rf.persist()
+		go rf.persist()
 		reply.Success = true
 		reply.Term = args.Term
 		// DPrintf("Raft %v logs %v", rf.me, rf.logs)
@@ -313,7 +397,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("Raft %v reject AppendEntries from %v, term %v,%v", rf.me, args.LeaderId, args.Term, rf.currentTerm)
 	reply.Success = false
 	reply.Term = rf.currentTerm
-	rf.persist()
+	go rf.persist()
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -324,6 +408,9 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+// ---------------------------------------
+// ---leader func use AppendEntries RPC---
+// ---------------------------------------
 // leader: send heartbeat to all followers in time
 func (rf *Raft) sendHeartbeat() {
 	for !rf.killed() {
@@ -371,9 +458,24 @@ func (rf *Raft) Copytofollower(i int) {
 	rf.mu.Lock()
 	for rf.isleader() && !rf.killed() {
 		for rf.matchIndex[i] < len(rf.logs)-1+rf.snapshotindex {
-			// DPrintf("Raft %v matchindex[%v] %v nextindex[%v] %v", rf.me, i, rf.matchIndex[i], i, rf.nextIndex[i])
+			DPrintf("Raft %v matchindex[%v] %v nextindex[%v] %v, snapindex %v", rf.me, i, rf.matchIndex[i], i, rf.nextIndex[i], rf.snapshotindex)
 			if !rf.isleader() {
 				break
+			}
+			if rf.nextIndex[i] <= rf.snapshotindex {
+				// need to send snapshot
+				snargs := InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.snapshotindex,
+					LastIncludedTerm:  rf.logs[0].Term,
+					Snapshot:          rf.snapshot,
+				}
+				snreply := InstallSnapshotReply{}
+				rf.mu.Unlock()
+				rf.sendInstallSnapshot(i, &snargs, &snreply)
+				rf.mu.Lock()
+				rf.nextIndex[i] = rf.snapshotindex + 1
 			}
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -406,7 +508,7 @@ func (rf *Raft) Copytofollower(i int) {
 					rf.setfollower()
 					rf.votedFor = -1
 					rf.leaderid = -1
-					rf.persist()
+					go rf.persist()
 					break
 				}
 				if ok {
@@ -421,7 +523,7 @@ func (rf *Raft) Copytofollower(i int) {
 					} else {
 						nextindex = reply.Xlen
 					}
-					if nextindex < rf.nextIndex[i] {
+					if nextindex < rf.nextIndex[i] && nextindex > rf.matchIndex[i] {
 						rf.nextIndex[i] = nextindex
 					}
 				}
@@ -455,7 +557,7 @@ func (rf *Raft) Checkcommit() {
 			if count > (len(rf.peers) >> 1) {
 				// send apply message
 				rf.commitIndex = i
-				rf.persist()
+				go rf.persist()
 				rf.apply.Signal()
 				DPrintf("Raft %v commit to log %v cmd %v, snapshotindex %v, commitIndex %v, i %v,len %v", rf.me, i, rf.logs[i-rf.snapshotindex].Command, rf.snapshotindex, rf.commitIndex, i, len(rf.logs)-1)
 			}
@@ -465,8 +567,9 @@ func (rf *Raft) Checkcommit() {
 	}
 }
 
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
+// --------------------------------------
+// -------- RequestVote RPC -------------
+// --------------------------------------
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term         int // candidate's term
@@ -475,8 +578,7 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // term of candidate's last log entry
 }
 
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
+// RequestVote RPC reply structure.
 type RequestVoteReply struct {
 	// Your data here (3A).
 	Term        int  // current term, for candidate to update itself
@@ -492,12 +594,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.setfollower()
-		rf.persist()
+		go rf.persist()
 	} else if rf.currentTerm > args.Term {
 		DPrintf("Raft %v reject vote request from %v, term %v, because of term is small", rf.me, args.CandidateId, args.Term)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		rf.persist()
+		go rf.persist()
 		return
 	}
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
@@ -508,13 +610,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 		rf.heartbeattime = time.Now()
-		rf.persist()
+		go rf.persist()
 		return
 	}
 	DPrintf("Raft %v reject vote request from %v, term %v, because of he is voted or log is small", rf.me, args.CandidateId, args.Term)
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
-	rf.persist()
+	go rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -549,6 +651,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// -----------------------------------------
+// -- Candidate func use RequestVote RPC ---
+// -----------------------------------------
 // use as go routine
 // send vote request, check the result
 // if get majority vote, wake the main thread
@@ -580,7 +685,7 @@ func (rf *Raft) SendRV(i int, condi *sync.Cond) {
 			rf.votedFor = -1
 			rf.leaderid = -1
 			condi.Signal()
-			rf.persist()
+			go rf.persist()
 		}
 		DPrintf("Raft %v get reject from %v", rf.me, i)
 	}
@@ -596,7 +701,7 @@ func (rf *Raft) Startelection() {
 	rf.votedFor = rf.me
 	rf.heartbeattime = time.Now()
 	rf.setcandidate()
-	rf.persist()
+	go rf.persist()
 
 	// condition variable to wait for the result
 	var condi = sync.NewCond(&rf.mu)
@@ -642,6 +747,9 @@ func (rf *Raft) Startelection() {
 	}
 }
 
+// ------------------------------------
+// ----------- upper func -------------
+// ------------------------------------
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -672,7 +780,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	// DPrintf("Raft %v logs %v", rf.me, rf.logs)
 	rf.getlog.Broadcast()
-	rf.persist()
+	go rf.persist()
 
 	return index, term, isLeader
 }
