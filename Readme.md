@@ -4,10 +4,10 @@
 
 对于leader：
 
-- Start方法，负责将命令写入logs，同时通过条件变量唤醒负责向follower发送AppendEntries rpc的线程
-- 选举成功时，对每一个follower，发起一个线程，在一个循环中，利用条件变量，不断的check和发送apply appends rpc。循环在不是leader时被打破，线程也会自动退出（对leader的所有线程都是）。
-- 选举成功时，发起一个线程，不断发送heart beat。
-- 选举成功时，发起一个线程，不断检查logs复制的情况和设置commitindex。
+- Start方法，负责将命令写入logs，同时通过条件变量唤醒负责向follower发送AppendEntries rpc的协程
+- 选举成功时，对每一个follower，发起一个协程，在一个循环中，利用条件变量，不断的check和发送apply appends rpc。循环在不是leader时被打破，协程也会自动退出（对leader的所有协程都是）。（当网络原因导致rpc发送失败时，会发起更多协程(<=3)尝试）
+- 选举成功时，发起一个协程，不断发送heart beat。
+- 选举成功时，发起一个协程，不断检查logs复制的情况和设置commitindex。
 
 对于candidate：
 
@@ -15,8 +15,8 @@
 
 对于follower（对于所有的peer）：
 
-- 初始化时发起一个线程，用于检查commitindex和lastapplied index，并向applych发送commit的logs信息。
-- 初始化时发起一个线程，用于检查heartbeat时间并在超时时转换成candidate
+- 初始化时发起一个协程，用于检查commitindex和lastapplied index，并向applych发送commit的logs信息。
+- 初始化时发起一个协程，用于检查heartbeat时间并在超时时转换成candidate
 
 ### 易错问题
 
@@ -48,3 +48,7 @@ Then the leader's logic can be something like:
 >   Case 3: follower's log is too short:
 >
 > ​    nextIndex = XLen
+
+End：
+
+> 单独跑3A～3D的测试可以过，但是一起跑会由于超过十分钟而被ban掉。还是需要check一下。

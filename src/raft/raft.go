@@ -40,6 +40,7 @@ type Log struct {
 const Follower = 1
 const Candidate = 2
 const Leader = 3
+const THREADCOUNT = 3
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -71,9 +72,10 @@ type Raft struct {
 	matchIndex []int //index of highest log entry known to be replicated on server
 
 	// logs
-	logs   []Log
-	getlog sync.Cond
-	apply  sync.Cond
+	logs            []Log
+	getlog          sync.Cond
+	apply           sync.Cond
+	peerthreadcount []int // thread(copy to follower) count for each peer
 
 	// snapshot
 	snapshotindex int
@@ -198,10 +200,12 @@ type ApplyMsg struct {
 // send apply message to service
 func (rf *Raft) Sendapplymessage() {
 	go func() {
-		time.Sleep(20 * time.Millisecond)
-		rf.mu.Lock()
-		rf.apply.Signal()
-		rf.mu.Unlock()
+		for !rf.killed() {
+			time.Sleep(20 * time.Millisecond)
+			rf.mu.Lock()
+			rf.apply.Signal()
+			rf.mu.Unlock()
+		}
 	}()
 
 	// check and send apply message
@@ -258,6 +262,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	DPrintf("Raft %v Save to snapshot to index %v", rf.me, index)
 	// last log at index0
 	rf.logs = rf.logs[index-rf.snapshotindex:]
+	rf.logs = append([]Log{}, rf.logs...)
 	rf.snapshotindex = index
 	rf.snapshot = snapshot
 	rf.persist()
@@ -377,6 +382,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Term = args.Term
 			return
 		}
+		// mean old rpc
 		if args.PrevLogIndex-rf.snapshotindex < 0 {
 			reply.Success = true
 			reply.Term = args.Term
@@ -411,11 +417,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		DPrintf("Raft %v receive AppendEntries from %v, term %v,%v, entry len %v", rf.me, args.LeaderId, args.Term, args.PrevLogIndex+1, lene)
 		// append entries
-		rf.logs = rf.logs[:args.PrevLogIndex+1-rf.snapshotindex]
-		rf.logs = append(rf.logs, args.Entries...)
+		// DPrintf("Raft %v logs %v", rf.me, rf.logs)
+		logindex := args.PrevLogIndex + 1 - rf.snapshotindex
+		cut := false
+		index := 0
+		if args.PrevLogIndex+lene <= rf.snapshotindex+lenlogs-1 {
+			for index = 0; index < lene; index++ {
+				if args.Entries[index].Term != rf.logs[index+logindex].Term {
+					cut = true
+					break
+				}
+			}
+		} else {
+			cut = true
+		}
+		if cut {
+			rf.logs = rf.logs[:logindex]
+			rf.logs = append(rf.logs, args.Entries...)
+		}
 		reply.Success = true
 		reply.Term = args.Term
 		// DPrintf("Raft %v logs %v", rf.me, rf.logs)
+
+		// rf.logs = rf.logs[:args.PrevLogIndex+1-rf.snapshotindex]
+		// rf.logs = append(rf.logs, args.Entries...)
+		// reply.Success = true
+		// reply.Term = args.Term
 		return
 	}
 	DPrintf("Raft %v reject AppendEntries from %v, term %v,%v", rf.me, args.LeaderId, args.Term, rf.currentTerm)
@@ -489,6 +516,11 @@ func (rf *Raft) Copytofollower(i int) {
 				rf.mu.Unlock()
 				snok := rf.sendInstallSnapshot(i, &snargs, &snreply)
 				rf.mu.Lock()
+
+				if rf.currentTerm != snargs.Term {
+					break
+				}
+
 				if snreply.Term > rf.currentTerm {
 					rf.currentTerm = snreply.Term
 					rf.setfollower()
@@ -504,6 +536,10 @@ func (rf *Raft) Copytofollower(i int) {
 						rf.matchIndex[i] = snapshotindex
 					}
 				} else {
+					if rf.peerthreadcount[i] <= THREADCOUNT {
+						rf.peerthreadcount[i]++
+						go rf.Copytofollower(i)
+					}
 					continue
 				}
 			}
@@ -529,6 +565,11 @@ func (rf *Raft) Copytofollower(i int) {
 			rf.mu.Unlock()
 			ok := rf.sendAppendEntries(i, &args, &reply)
 			rf.mu.Lock()
+
+			if rf.currentTerm != args.Term {
+				// something happen
+				break
+			}
 
 			// check result
 			if reply.Success {
@@ -561,11 +602,17 @@ func (rf *Raft) Copytofollower(i int) {
 					if nextindex < rf.nextIndex[i] {
 						rf.nextIndex[i] = nextindex
 					}
+				} else {
+					if rf.peerthreadcount[i] <= THREADCOUNT {
+						rf.peerthreadcount[i]++
+						go rf.Copytofollower(i)
+					}
 				}
 			}
 		}
 		rf.getlog.Wait()
 	}
+	rf.peerthreadcount[i]--
 	rf.mu.Unlock()
 }
 
@@ -689,21 +736,19 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // use as go routine
 // send vote request, check the result
 // if get majority vote, wake the main thread
-func (rf *Raft) SendRV(i int, condi *sync.Cond) {
+func (rf *Raft) SendRV(i int, condi *sync.Cond, args RequestVoteArgs) {
 	if !rf.iscandidate() {
 		return
 	}
 	rf.mu.Lock()
-	args := RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateId:  rf.me,
-		LastLogIndex: len(rf.logs) - 1 + rf.snapshotindex,
-		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
-	}
 	reply := RequestVoteReply{}
 	rf.mu.Unlock()
 	rf.sendRequestVote(i, &args, &reply)
 	rf.mu.Lock()
+	if rf.currentTerm != args.Term {
+		rf.mu.Unlock()
+		return
+	}
 	if reply.VoteGranted {
 		rf.voted++
 		DPrintf("Raft %v get vote from %v, voted %d", rf.me, i, rf.voted)
@@ -738,21 +783,31 @@ func (rf *Raft) Startelection() {
 	// condition variable to wait for the result
 	var condi = sync.NewCond(&rf.mu)
 
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.logs) - 1 + rf.snapshotindex,
+		LastLogTerm:  rf.logs[len(rf.logs)-1].Term,
+	}
+
 	// send RequestVote to all other servers
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go rf.SendRV(i, condi)
+		go rf.SendRV(i, condi, args)
 	}
 	go func() {
-		time.Sleep(time.Duration(300+(rand.Int63()%1500)) * time.Millisecond)
+		time.Sleep(time.Duration(300+(rand.Int63()%450)) * time.Millisecond)
 		rf.mu.Lock()
 		condi.Signal()
 		rf.mu.Unlock()
 	}()
 
 	condi.Wait()
+	if rf.currentTerm != args.Term {
+		return
+	}
 
 	// check the result
 	if rf.voted > len(rf.peers)/2 {
@@ -765,12 +820,14 @@ func (rf *Raft) Startelection() {
 				rf.nextIndex[i] = len(rf.logs) + rf.snapshotindex
 				rf.matchIndex[i] = 0
 			}
+
 			go rf.sendHeartbeat()
 			for i := range rf.peers {
 				if i == rf.me {
 					continue
 				}
 				go rf.Copytofollower(i)
+				rf.peerthreadcount[i] = 1
 			}
 			// used for wake copy to follower
 			go func() {
@@ -781,8 +838,8 @@ func (rf *Raft) Startelection() {
 					rf.mu.Unlock()
 				}
 			}()
+			// leader need commit logs
 			go rf.Checkcommit()
-
 		}
 	} else {
 		rf.setfollower()
@@ -839,6 +896,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.getlog.Broadcast()
+	rf.apply.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -897,6 +956,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.snapshotindex = 0
 	rf.getlog = *sync.NewCond(&rf.mu)
 	rf.apply = *sync.NewCond(&rf.mu)
+	rf.peerthreadcount = make([]int, len(peers))
+	for i := 0; i < len(peers); i++ {
+		rf.peerthreadcount[i] = 0
+	}
 	DPrintf("Raft %v created", rf.me)
 
 	// initialize from state persisted before a crash
