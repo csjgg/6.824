@@ -326,8 +326,55 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 // send InstallSnapshot RPC to server
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	if !rf.isleader() {
+		return false
+	}
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
+}
+
+// --------------------------------------
+// ----- InstallSnapshot user func ------
+// --------------------------------------
+// get args, need call under lock
+func (rf *Raft) GetinstallSnapshotArgs(i int, currentterm int) (InstallSnapshotArgs, int) {
+	args := InstallSnapshotArgs{
+		Term:              currentterm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.snapshotindex,
+		LastIncludedTerm:  rf.logs[0].Term,
+		Snapshot:          rf.snapshot,
+	}
+	return args, rf.snapshotindex
+}
+
+// process install snapshot reply, need to call under lock
+func (rf *Raft) ProcessinstallSnapshot(reply InstallSnapshotReply, snok bool, i int, snapshotindex int, lastterm int) bool {
+	if rf.currentTerm != lastterm {
+		return false
+	}
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.setfollower()
+		rf.votedFor = -1
+		rf.leaderid = -1
+		rf.persist()
+		return false
+	}
+	if snok {
+		if reply.Success {
+			DPrintf("Raft %v send snapshot to %v, term %v", rf.me, i, rf.currentTerm)
+			rf.nextIndex[i] = snapshotindex + 1
+			rf.matchIndex[i] = snapshotindex
+		}
+	} else {
+		if rf.peerthreadcount[i] <= THREADCOUNT {
+			rf.peerthreadcount[i]++
+			go rf.Copytofollower(i, lastterm)
+		}
+		return false
+	}
+	return true
 }
 
 // --------------------------------------
@@ -374,18 +421,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DPrintf("Raft %v commitindex %v", rf.me, rf.commitIndex)
 			rf.apply.Signal()
 		}
-		if lene == 0 && args.PrevLogIndex == 0 && args.PrevLogTerm == 0 {
-			// DPrintf("Raft %v receive heartbeat from %v, term %v", rf.me, args.LeaderId, args.Term)
-			// heartbeat
-			rf.heartbeattime = time.Now()
-			reply.Success = true
-			reply.Term = args.Term
-			return
-		}
 		// mean old rpc
 		if args.PrevLogIndex-rf.snapshotindex < 0 {
 			reply.Success = true
-			reply.Term = args.Term
+			reply.Term = rf.currentTerm
 			return
 		}
 		// follower's log is too short
@@ -409,10 +448,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DPrintf("Raft %v return Xterm", rf.me)
 			return
 		}
+
 		rf.heartbeattime = time.Now()
 		if lene == 0 {
+			DPrintf("Raft %v receive heartbeat from %v, term %v", rf.me, args.LeaderId, args.Term)
 			reply.Success = true
-			reply.Term = args.Term
+			reply.Term = rf.currentTerm
 			return
 		}
 		DPrintf("Raft %v receive AppendEntries from %v, term %v,%v, entry len %v", rf.me, args.LeaderId, args.Term, args.PrevLogIndex+1, lene)
@@ -432,11 +473,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			cut = true
 		}
 		if cut {
-			rf.logs = rf.logs[:logindex]
-			rf.logs = append(rf.logs, args.Entries...)
+			rf.logs = rf.logs[:logindex+index]
+			rf.logs = append(rf.logs, args.Entries[index:]...)
 		}
 		reply.Success = true
-		reply.Term = args.Term
+		reply.Term = rf.currentTerm
 		// DPrintf("Raft %v logs %v", rf.me, rf.logs)
 
 		// rf.logs = rf.logs[:args.PrevLogIndex+1-rf.snapshotindex]
@@ -459,194 +500,76 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 }
 
 // ---------------------------------------
-// ---leader func use AppendEntries RPC---
+// ----- AppendEntries RPC user func -----
 // ---------------------------------------
-// leader: send heartbeat to all followers in time
-func (rf *Raft) sendHeartbeat() {
-	for !rf.killed() {
-		if !rf.isleader() {
-			// if other win, stop heartbeat
-			break
-		}
-		// send heartbeat to all followers
-		for i := range rf.peers {
-			if i == rf.me {
-				continue
-			}
-			rf.mu.Lock()
-			args := AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
-			}
-			if rf.commitIndex > rf.matchIndex[i] {
-				args.LeaderCommit = rf.matchIndex[i]
-			} else {
-				args.LeaderCommit = rf.commitIndex
-			}
-			rf.mu.Unlock()
-			reply := AppendEntriesReply{}
-			go rf.sendAppendEntries(i, &args, &reply)
-		}
-		ms := 100 + (rand.Int63() % 50)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+// get args, need call under lock
+func (rf *Raft) GetAppendEntriesArgs(i int, heartbeat bool, currentterm int) (AppendEntriesArgs, int, int) {
+	args := AppendEntriesArgs{
+		Term:         currentterm,
+		LeaderId:     rf.me,
+		PrevLogIndex: rf.nextIndex[i] - 1,
+		PrevLogTerm:  rf.logs[rf.nextIndex[i]-1-rf.snapshotindex].Term,
 	}
+	if !heartbeat {
+		args.Entries = append([]Log{}, rf.logs[rf.nextIndex[i]-rf.snapshotindex:]...)
+	}
+	if rf.commitIndex > rf.matchIndex[i] {
+		args.LeaderCommit = rf.matchIndex[i]
+	} else {
+		args.LeaderCommit = rf.commitIndex
+	}
+	nextindex := rf.nextIndex[i]
+	len := len(args.Entries)
+	return args, nextindex, len
 }
 
-// copy log to follower
-func (rf *Raft) Copytofollower(i int) {
-	// check and copy to follower
-	rf.mu.Lock()
-	for rf.isleader() && !rf.killed() {
-		for rf.matchIndex[i] < len(rf.logs)-1+rf.snapshotindex {
-			// DPrintf("Raft %v matchindex[%v] %v nextindex[%v] %v, snapindex %v", rf.me, i, rf.matchIndex[i], i, rf.nextIndex[i], rf.snapshotindex)
-			if !rf.isleader() {
-				break
-			}
-			if rf.nextIndex[i] <= rf.snapshotindex {
-				// need to send snapshot
-				snargs := InstallSnapshotArgs{
-					Term:              rf.currentTerm,
-					LeaderId:          rf.me,
-					LastIncludedIndex: rf.snapshotindex,
-					LastIncludedTerm:  rf.logs[0].Term,
-					Snapshot:          rf.snapshot,
-				}
-				snreply := InstallSnapshotReply{}
-				snapshotindex := rf.snapshotindex
-				rf.mu.Unlock()
-				snok := rf.sendInstallSnapshot(i, &snargs, &snreply)
-				rf.mu.Lock()
+// Process ae rpc response
+func (rf *Raft) ProcessAppendEntries(reply AppendEntriesReply, ok bool, i int, nextindex int, lastterm int, len int) bool {
+	if rf.currentTerm != lastterm {
+		// something happen
+		return false
+	}
 
-				if rf.currentTerm != snargs.Term {
-					break
-				}
+	// check result
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.setfollower()
+		rf.votedFor = -1
+		rf.leaderid = -1
+		rf.persist()
+		return false
+	}
 
-				if snreply.Term > rf.currentTerm {
-					rf.currentTerm = snreply.Term
-					rf.setfollower()
-					rf.votedFor = -1
-					rf.leaderid = -1
-					rf.persist()
-					break
+	if reply.Success {
+		if rf.nextIndex[i] < nextindex+len {
+			rf.nextIndex[i] = nextindex + len
+			rf.matchIndex[i] = nextindex + len - 1
+			DPrintf("Raft %v nextindex[%v] %v matchindex[%v] %v", rf.me, i, rf.nextIndex[i], i, rf.matchIndex[i])
+		}
+	} else {
+		if ok {
+			if reply.Xterm != 0 {
+				nextindex--
+				for nextindex-rf.snapshotindex > 0 && rf.logs[nextindex-rf.snapshotindex].Term > reply.Xterm {
+					nextindex--
 				}
-				if snok {
-					if snreply.Success {
-						DPrintf("Raft %v send snapshot to %v, term %v", rf.me, i, rf.currentTerm)
-						rf.nextIndex[i] = snapshotindex + 1
-						rf.matchIndex[i] = snapshotindex
-					}
-				} else {
-					if rf.peerthreadcount[i] <= THREADCOUNT {
-						rf.peerthreadcount[i]++
-						go rf.Copytofollower(i)
-					}
-					continue
-				}
-			}
-			if rf.nextIndex[i] <= rf.snapshotindex {
-				continue
-			}
-			args := AppendEntriesArgs{
-				Term:         rf.currentTerm,
-				LeaderId:     rf.me,
-				PrevLogIndex: rf.nextIndex[i] - 1,
-				PrevLogTerm:  rf.logs[rf.nextIndex[i]-1-rf.snapshotindex].Term,
-				Entries:      rf.logs[rf.nextIndex[i]-rf.snapshotindex:],
-			}
-			if rf.commitIndex > rf.matchIndex[i] {
-				args.LeaderCommit = rf.matchIndex[i]
-			} else {
-				args.LeaderCommit = rf.commitIndex
-			}
-			nextindex := rf.nextIndex[i]
-			len := len(args.Entries)
-			reply := AppendEntriesReply{}
-			DPrintf("Raft %v send AppendEntries to %v, term %v, nextindex %v, len %v", rf.me, i, rf.currentTerm, nextindex, len)
-			rf.mu.Unlock()
-			ok := rf.sendAppendEntries(i, &args, &reply)
-			rf.mu.Lock()
-
-			if rf.currentTerm != args.Term {
-				// something happen
-				break
-			}
-
-			// check result
-			if reply.Success {
-				if rf.nextIndex[i] < nextindex+len {
-					rf.nextIndex[i] = nextindex + len
-					rf.matchIndex[i] = nextindex + len - 1
-					DPrintf("Raft %v nextindex[%v] %v matchindex[%v] %v", rf.me, i, rf.nextIndex[i], i, rf.matchIndex[i])
+				if nextindex-rf.snapshotindex == 0 || rf.logs[nextindex-rf.snapshotindex].Term < reply.Term {
+					nextindex = reply.Xindex
 				}
 			} else {
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.setfollower()
-					rf.votedFor = -1
-					rf.leaderid = -1
-					rf.persist()
-					break
-				}
-				if ok {
-					if reply.Xterm != 0 {
-						nextindex--
-						for nextindex-rf.snapshotindex > 0 && rf.logs[nextindex-rf.snapshotindex].Term > reply.Xterm {
-							nextindex--
-						}
-						if nextindex-rf.snapshotindex == 0 || rf.logs[nextindex-rf.snapshotindex].Term < reply.Term {
-							nextindex = reply.Xindex
-						}
-					} else {
-						nextindex = reply.Xlen
-					}
-					if nextindex < rf.nextIndex[i] {
-						rf.nextIndex[i] = nextindex
-					}
-				} else {
-					if rf.peerthreadcount[i] <= THREADCOUNT {
-						rf.peerthreadcount[i]++
-						go rf.Copytofollower(i)
-					}
-				}
+				nextindex = reply.Xlen
+			}
+			if nextindex < rf.nextIndex[i] {
+				rf.nextIndex[i] = nextindex
+			}
+		} else {
+			if rf.peerthreadcount[i] <= THREADCOUNT {
+				rf.peerthreadcount[i]++
+				go rf.Copytofollower(i, lastterm)
 			}
 		}
-		rf.getlog.Wait()
 	}
-	rf.peerthreadcount[i]--
-	rf.mu.Unlock()
-}
-
-// check if the log is committed
-// if majority of followers have the log, commit it
-// the heartbeats will update commitIndex, so we no need to send rpc to followers
-func (rf *Raft) Checkcommit() {
-	DPrintf("Raft %v check commit", rf.me)
-	for !rf.killed() && rf.isleader() {
-		rf.mu.Lock()
-		for i := (len(rf.logs) - 1 + rf.snapshotindex); i > rf.commitIndex && rf.logs[i-rf.snapshotindex].Term == rf.currentTerm; i-- {
-			if !rf.isleader() {
-				break
-			}
-			count := 1
-			for j := range rf.peers {
-				if j == rf.me {
-					continue
-				}
-				if rf.matchIndex[j] >= i {
-					count++
-				}
-			}
-			if count > (len(rf.peers) >> 1) {
-				// send apply message
-				rf.commitIndex = i
-				rf.persist()
-				rf.apply.Signal()
-				DPrintf("Raft %v commit to log %v cmd %v, snapshotindex %v, commitIndex %v, i %v,len %v", rf.me, i, rf.logs[i-rf.snapshotindex].Command, rf.snapshotindex, rf.commitIndex, i, len(rf.logs)-1)
-			}
-		}
-		rf.mu.Unlock()
-		time.Sleep(10 * time.Millisecond)
-	}
+	return true
 }
 
 // --------------------------------------
@@ -731,7 +654,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 // -----------------------------------------
-// -- Candidate func use RequestVote RPC ---
+// ----------- Candidate func --------------
 // -----------------------------------------
 // use as go routine
 // send vote request, check the result
@@ -820,13 +743,12 @@ func (rf *Raft) Startelection() {
 				rf.nextIndex[i] = len(rf.logs) + rf.snapshotindex
 				rf.matchIndex[i] = 0
 			}
-
-			go rf.sendHeartbeat()
+			go rf.sendHeartbeat(rf.currentTerm)
 			for i := range rf.peers {
 				if i == rf.me {
 					continue
 				}
-				go rf.Copytofollower(i)
+				go rf.Copytofollower(i, rf.currentTerm)
 				rf.peerthreadcount[i] = 1
 			}
 			// used for wake copy to follower
@@ -843,6 +765,134 @@ func (rf *Raft) Startelection() {
 		}
 	} else {
 		rf.setfollower()
+	}
+}
+
+// ---------------------------------------
+// ----------- leader func ---------------
+// ---------------------------------------
+func (rf *Raft) sendHeartbeat(currentterm int) {
+	for rf.isleader() && !rf.killed() {
+		// send heartbeat to all followers
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			go rf.sendHeartbeattoi(i, currentterm)
+		}
+		ms := 100 + (rand.Int63() % 50)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
+// leader: send heartbeat to one follower in time
+func (rf *Raft) sendHeartbeattoi(i int, currentterm int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.isleader() && !rf.killed() {
+		if rf.currentTerm != currentterm {
+			return
+		}
+		if rf.nextIndex[i] <= rf.snapshotindex {
+			// need to send snapshot
+			snargs, snapshotindex := rf.GetinstallSnapshotArgs(i, currentterm)
+			snreply := InstallSnapshotReply{}
+			rf.mu.Unlock()
+			snok := rf.sendInstallSnapshot(i, &snargs, &snreply)
+			rf.mu.Lock()
+			processok := rf.ProcessinstallSnapshot(snreply, snok, i, snapshotindex, snargs.Term)
+			if !processok {
+				return
+			}
+		}
+		if rf.nextIndex[i] <= rf.snapshotindex {
+			return
+		}
+		args, nextindex, len := rf.GetAppendEntriesArgs(i, true, currentterm)
+		reply := AppendEntriesReply{}
+		DPrintf("Raft %v send heartbeat to %v, term %v, nextindex %v, len %v", rf.me, i, rf.currentTerm, nextindex, len)
+		rf.mu.Unlock()
+		ok := rf.sendAppendEntries(i, &args, &reply)
+		rf.mu.Lock()
+		rf.ProcessAppendEntries(reply, ok, i, nextindex, args.Term, len)
+	}
+}
+
+// copy log to follower
+func (rf *Raft) Copytofollower(i int, currentterm int) {
+	// check and copy to follower
+	rf.mu.Lock()
+	for rf.isleader() && !rf.killed() {
+		for rf.matchIndex[i] < len(rf.logs)-1+rf.snapshotindex {
+			// DPrintf("Raft %v matchindex[%v] %v nextindex[%v] %v, snapindex %v", rf.me, i, rf.matchIndex[i], i, rf.nextIndex[i], rf.snapshotindex)
+			if !rf.isleader() {
+				break
+			}
+			if rf.currentTerm != currentterm {
+				break
+			}
+			if rf.nextIndex[i] <= rf.snapshotindex {
+				// need to send snapshot
+				snargs, snapshotindex := rf.GetinstallSnapshotArgs(i, currentterm)
+				snreply := InstallSnapshotReply{}
+				rf.mu.Unlock()
+				snok := rf.sendInstallSnapshot(i, &snargs, &snreply)
+				rf.mu.Lock()
+				processok := rf.ProcessinstallSnapshot(snreply, snok, i, snapshotindex, snargs.Term)
+				if !processok {
+					continue
+				}
+			}
+			if rf.nextIndex[i] <= rf.snapshotindex {
+				continue
+			}
+			args, nextindex, len := rf.GetAppendEntriesArgs(i, false, currentterm)
+			reply := AppendEntriesReply{}
+			DPrintf("Raft %v send AppendEntries to %v, term %v, nextindex %v, len %v", rf.me, i, rf.currentTerm, nextindex, len)
+			rf.mu.Unlock()
+			ok := rf.sendAppendEntries(i, &args, &reply)
+			rf.mu.Lock()
+			processaeok := rf.ProcessAppendEntries(reply, ok, i, nextindex, args.Term, len)
+			if !processaeok {
+				break
+			}
+		}
+		rf.getlog.Wait()
+	}
+	rf.peerthreadcount[i]--
+	rf.mu.Unlock()
+}
+
+// check if the log is committed
+// if majority of followers have the log, commit it
+// the heartbeats will update commitIndex, so we no need to send rpc to followers
+func (rf *Raft) Checkcommit() {
+	DPrintf("Raft %v check commit", rf.me)
+	for !rf.killed() && rf.isleader() {
+		rf.mu.Lock()
+		for i := (len(rf.logs) - 1 + rf.snapshotindex); i > rf.commitIndex && rf.logs[i-rf.snapshotindex].Term == rf.currentTerm; i-- {
+			if !rf.isleader() {
+				break
+			}
+			count := 1
+			for j := range rf.peers {
+				if j == rf.me {
+					continue
+				}
+				if rf.matchIndex[j] >= i {
+					count++
+				}
+			}
+			if count > (len(rf.peers) >> 1) {
+				// send apply message
+				rf.commitIndex = i
+				rf.persist()
+				rf.apply.Signal()
+				DPrintf("Raft %v commit to log %v cmd %v, snapshotindex %v, commitIndex %v, i %v,len %v", rf.me, i, rf.logs[i-rf.snapshotindex].Command, rf.snapshotindex, rf.commitIndex, i, len(rf.logs)-1)
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
